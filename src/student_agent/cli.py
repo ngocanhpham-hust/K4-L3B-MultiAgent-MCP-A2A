@@ -7,6 +7,7 @@ import sys
 from pathlib import Path
 
 from .cases import load_case_set
+from .competition import bootstrap_run
 from .config import Settings
 from .contracts import Contracts
 from .mcp_gateway import connect_gateway
@@ -19,12 +20,21 @@ def _root(value: str) -> Path:
     return Path(value).resolve()
 
 
-async def _show_tools(root: Path) -> None:
+def _error_message(exc: BaseException) -> str:
+    while isinstance(exc, BaseExceptionGroup) and exc.exceptions:
+        exc = exc.exceptions[0]
+    return str(exc)
+
+
+async def _show_tools(root: Path, show_schemas: bool = False) -> None:
     settings = Settings.load(root)
     contracts = Contracts(root / "contracts" / "schemas")
     async with connect_gateway(settings.mcp_endpoint, settings.team_api_key, contracts) as gateway:
         for tool in await gateway.list_tools():
-            print(tool)
+            if show_schemas:
+                print(json.dumps({"name": tool, "input_schema": await gateway.tool_schema(tool)}))
+            else:
+                print(tool)
 
 
 async def _run(root: Path) -> None:
@@ -33,17 +43,23 @@ async def _run(root: Path) -> None:
     contracts = Contracts(root / "contracts" / "schemas")
     output_root = root / "outputs"
     trace_path = root / "traces" / "trace.jsonl"
-    output_root.mkdir(parents=True, exist_ok=True)
-    trace_path.parent.mkdir(parents=True, exist_ok=True)
-    for stale in output_root.glob("*.json"):
-        stale.unlink()
-    trace_path.unlink(missing_ok=True)
-    trace = TraceWriter(trace_path, contracts)
 
+    await bootstrap_run(
+        settings,
+        variant_id=case_set.variant_id,
+        case_set_version=case_set.version,
+    )
     async with connect_gateway(settings.mcp_endpoint, settings.team_api_key, contracts) as gateway:
         discovered_tools = await gateway.list_tools()
         if not discovered_tools:
             raise RuntimeError("MCP Gateway returned no tools")
+        # Authenticate and discover first so a bad endpoint/key cannot erase a good prior run.
+        output_root.mkdir(parents=True, exist_ok=True)
+        trace_path.parent.mkdir(parents=True, exist_ok=True)
+        for stale in output_root.glob("*.json"):
+            stale.unlink()
+        trace_path.unlink(missing_ok=True)
+        trace = TraceWriter(trace_path, contracts)
         for case_id in case_set.case_ids:
             case = case_set.cases[case_id]
             trace.emit(case_id=case_id, event_type="case_received", actor="coordinator")
@@ -65,7 +81,12 @@ def parser() -> argparse.ArgumentParser:
     result.add_argument("--root", default=".", help="repository root (default: current directory)")
     commands = result.add_subparsers(dest="command", required=True)
     commands.add_parser("validate-inputs", help="validate case-set.json and all 100 inputs")
-    commands.add_parser("mcp-tools", help="authenticate and list discovered MCP tools")
+    mcp_tools = commands.add_parser(
+        "mcp-tools", help="authenticate and list discovered MCP tools"
+    )
+    mcp_tools.add_argument(
+        "--schemas", action="store_true", help="also print each discovered input schema"
+    )
     commands.add_parser("run", help="run the implemented workflow for all cases")
     commands.add_parser("validate", help="validate outputs and observable trace")
     package = commands.add_parser("package", help="validate and build the submission ZIP")
@@ -84,7 +105,7 @@ def main() -> None:
                 f"{len(case_set.case_ids)} cases"
             )
         elif args.command == "mcp-tools":
-            asyncio.run(_show_tools(root))
+            asyncio.run(_show_tools(root, args.schemas))
         elif args.command == "run":
             asyncio.run(_run(root))
         elif args.command == "validate":
@@ -95,8 +116,8 @@ def main() -> None:
         elif args.command == "package":
             destination = package_submission(root, root / args.output)
             print(f"OK: {destination}")
-    except (OSError, RuntimeError, ValueError) as exc:
-        print(f"ERROR: {exc}", file=sys.stderr)
+    except (OSError, RuntimeError, ValueError, ExceptionGroup) as exc:
+        print(f"ERROR: {_error_message(exc)}", file=sys.stderr)
         raise SystemExit(1) from exc
 
 

@@ -16,15 +16,34 @@ class EvidenceGateway:
     def __init__(self, session: ClientSession, contracts: Contracts) -> None:
         self._session = session
         self._contracts = contracts
+        self._tool_schemas: dict[str, dict[str, Any]] | None = None
 
     async def list_tools(self) -> list[str]:
-        response = await self._session.list_tools()
-        return sorted(tool.name for tool in response.tools)
+        if self._tool_schemas is None:
+            response = await self._session.list_tools()
+            self._tool_schemas = {
+                tool.name: dict(
+                    getattr(tool, "inputSchema", None)
+                    or getattr(tool, "input_schema", None)
+                    or {}
+                )
+                for tool in response.tools
+            }
+        return sorted(self._tool_schemas)
 
-    async def call(self, tool_name: str, *, case_id: str, **arguments: str) -> dict[str, Any]:
+    async def tool_schema(self, tool_name: str) -> dict[str, Any]:
+        """Return the discovered input schema without a second discovery request."""
+        await self.list_tools()
+        assert self._tool_schemas is not None
+        return dict(self._tool_schemas.get(tool_name, {}))
+
+    async def call(self, tool_name: str, *, case_id: str, **arguments: Any) -> dict[str, Any]:
         payload = {"case_id": case_id, **arguments}
         result = await self._session.call_tool(tool_name, arguments=payload)
-        if result.isError:
+        is_error = getattr(result, "isError", None)
+        if is_error is None:
+            is_error = getattr(result, "is_error", False)
+        if is_error:
             message = " ".join(
                 block.text for block in result.content if getattr(block, "text", None)
             )
